@@ -8,6 +8,7 @@ from sqlalchemy.exc import OperationalError
 from app.db import Base, engine
 from app.routers import courses
 
+# Week 08 CD pipeline demonstration change
 
 logging.basicConfig(
     level=logging.INFO,
