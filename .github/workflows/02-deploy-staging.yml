@@ -9,18 +9,39 @@ on:
     branches:
       - main
 
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
 jobs:
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
 
-    if: >
-      ${{ github.event.workflow_run.conclusion == 'success' }}
-
     environment:
       name: staging
 
     steps:
+      - name: Confirm CI succeeded on main
+        env:
+          CI_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          CI_EVENT: ${{ github.event.workflow_run.event }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          echo "CI conclusion: $CI_CONCLUSION"
+          echo "CI trigger event: $CI_EVENT"
+          echo "Commit to deploy: $CI_SHA"
+
+          if [ "$CI_CONCLUSION" != "success" ]; then
+            echo "CI did not succeed. Stopping before staging."
+            exit 1
+          fi
+
+          if [ "$CI_EVENT" != "push" ] && [ "$CI_EVENT" != "workflow_dispatch" ]; then
+            echo "CI was not a push or dispatch on main, so no images were built."
+            exit 1
+          fi
+
       - name: Checkout tested commit
         uses: actions/checkout@v4
         with:

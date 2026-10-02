@@ -1,6 +1,16 @@
 name: 04 - Deploy to Production
 
 on:
+  # Continuous Deployment: run automatically when the staging tests finish
+  workflow_run:
+    workflows:
+      - "03 - Test Staging"
+    types:
+      - completed
+    branches:
+      - main
+
+  # Manual fallback for re-deploying or rolling back to a known SHA
   workflow_dispatch:
     inputs:
       image_tag:
@@ -8,18 +18,21 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 jobs:
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
 
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+
     environment:
       name: production
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Login to Azure
         uses: azure/login@v3
         with:
@@ -31,6 +44,50 @@ jobs:
             --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
             --name ${{ vars.AKS_CLUSTER_NAME }} \
             --overwrite-existing
+
+      - name: Resolve image tag to promote
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          echo "Trigger event: $EVENT_NAME"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+            echo "Tag source: manual dispatch input"
+          else
+            TAGS=$(kubectl get deployment \
+              frontend user-service student-service \
+              lecturer-service course-service enrollment-service \
+              -n staging \
+              -o jsonpath='{range .items[*]}{.spec.template.spec.containers[0].image}{"\n"}{end}' \
+              | sed 's/.*://' | sort -u)
+
+            if [ "$(printf '%s\n' "$TAGS" | grep -c .)" -ne 1 ]; then
+              echo "Staging deployments do not share one image tag:"
+              echo "$TAGS"
+              exit 1
+            fi
+
+            TAG="$TAGS"
+            echo "Tag source: images running in staging after 03 passed"
+            echo "workflow_run.head_sha, for comparison: $RUN_HEAD_SHA"
+          fi
+
+          if ! [[ "$TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Not a full commit SHA: $TAG"
+            exit 1
+          fi
+
+          echo "Promoting image tag: $TAG"
+          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the promoted commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.image_tag }}
 
       - name: Create production namespace
         run: |
@@ -69,37 +126,37 @@ jobs:
       - name: Update frontend image
         run: |
           kubectl set image deployment/frontend \
-            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ inputs.image_tag }} \
+            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ steps.tag.outputs.image_tag }} \
             -n production
 
       - name: Update user-service image
         run: |
           kubectl set image deployment/user-service \
-            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ inputs.image_tag }} \
+            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ steps.tag.outputs.image_tag }} \
             -n production
 
       - name: Update student-service image
         run: |
           kubectl set image deployment/student-service \
-            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ inputs.image_tag }} \
+            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ steps.tag.outputs.image_tag }} \
             -n production
 
       - name: Update lecturer-service image
         run: |
           kubectl set image deployment/lecturer-service \
-            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ inputs.image_tag }} \
+            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ steps.tag.outputs.image_tag }} \
             -n production
 
       - name: Update course-service image
         run: |
           kubectl set image deployment/course-service \
-            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ inputs.image_tag }} \
+            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ steps.tag.outputs.image_tag }} \
             -n production
 
       - name: Update enrollment-service image
         run: |
           kubectl set image deployment/enrollment-service \
-            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ inputs.image_tag }} \
+            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ steps.tag.outputs.image_tag }} \
             -n production
 
       - name: Wait for frontend rollout
@@ -137,6 +194,85 @@ jobs:
           kubectl rollout status deployment/enrollment-service \
             -n production \
             --timeout=300s
+
+      - name: Verify production runs the promoted tag
+        env:
+          EXPECTED_TAG: ${{ steps.tag.outputs.image_tag }}
+        run: |
+          TAGS=$(kubectl get deployment \
+            frontend user-service student-service \
+            lecturer-service course-service enrollment-service \
+            -n production \
+            -o jsonpath='{range .items[*]}{.spec.template.spec.containers[0].image}{"\n"}{end}' \
+            | sed 's/.*://' | sort -u)
+
+          echo "Image tags running in production:"
+          echo "$TAGS"
+
+          if [ "$TAGS" != "$EXPECTED_TAG" ]; then
+            echo "Production is not running the promoted tag $EXPECTED_TAG."
+            exit 1
+          fi
+
+      - name: Wait for production frontend IP
+        run: |
+          for i in {1..30}; do
+
+            FRONTEND_IP=$(kubectl get service frontend \
+              -n production \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+            if [ -n "$FRONTEND_IP" ]; then
+              echo "FRONTEND_IP=$FRONTEND_IP" >> "$GITHUB_ENV"
+              echo "Production frontend: http://$FRONTEND_IP"
+              exit 0
+            fi
+
+            echo "Waiting for production frontend IP..."
+
+            sleep 10
+          done
+
+          echo "Unable to find production frontend IP."
+          exit 1
+
+      - name: Verify production frontend and backends
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --output /dev/null \
+            --retry 10 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "http://${FRONTEND_IP}/"
+
+          echo "Production frontend returned 200"
+
+          for SERVICE in users students lecturers courses enrollments; do
+            BODY=$(curl \
+              --fail \
+              --silent \
+              --show-error \
+              --retry 10 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              "http://${FRONTEND_IP}/api/${SERVICE}/health")
+
+            echo "/api/${SERVICE}/health -> ${BODY}"
+
+            echo "$BODY" | grep -q '"status":"healthy"'
+          done
+
+      - name: Check for OOMKilled containers
+        run: |
+          if kubectl get pods -n production \
+            -o jsonpath='{..lastState.terminated.reason}' \
+            | grep -q OOMKilled; then
+            echo "A production container was OOMKilled."
+            exit 1
+          fi
 
       - name: Show production resources
         run: |
