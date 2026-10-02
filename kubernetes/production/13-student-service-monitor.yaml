@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: student-service
+  namespace: production
+  labels:
+    app: student-service
+spec:
+  selector:
+    matchLabels:
+      app: student-service
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

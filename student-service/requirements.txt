@@ -10,3 +10,4 @@ python-dotenv==1.2.4
 azure-storage-blob==12.26.0
 pytest==8.4.1
 httpx==0.28.1
+prometheus-fastapi-instrumentator==8.1.0

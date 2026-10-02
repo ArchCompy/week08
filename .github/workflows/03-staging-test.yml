@@ -165,6 +165,17 @@ jobs:
             exit 1
           fi
 
+          APP_TARGET=$(query "up{namespace=\"$NAMESPACE\", job=\"student-service\"}")
+          echo "student-service /metrics target up: $APP_TARGET"
+
+          if [ "$APP_TARGET" != "1" ]; then
+            echo "Prometheus is not scraping student-service application metrics."
+            exit 1
+          fi
+
+          REQUESTS=$(query "sum(http_requests_total{namespace=\"$NAMESPACE\", job=\"student-service\"})")
+          echo "student-service requests recorded by Prometheus: $REQUESTS"
+
           echo "Memory working set per pod in $NAMESPACE (MiB):"
           curl -s http://localhost:9090/api/v1/query \
             --data-urlencode "query=sum by (pod) (container_memory_working_set_bytes{namespace=\"$NAMESPACE\", container!=\"\"}) / 1048576" \
