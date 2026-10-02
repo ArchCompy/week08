@@ -5,6 +5,12 @@ on:
   push:
     branches:
       - main
+    # Infrastructure and monitoring changes are handled by 00 - Infrastructure,
+    # so they do not rebuild and redeploy the application.
+    paths-ignore:
+      - "infra/**"
+      - "monitoring/**"
+      - ".github/workflows/00-infrastructure.yml"
 
   # Run the tests on pull requests into main. The build job below is
   # skipped for pull requests, so nothing is pushed to ACR or deployed.
