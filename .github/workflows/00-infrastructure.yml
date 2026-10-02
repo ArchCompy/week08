@@ -1,0 +1,227 @@
+name: 00 - Infrastructure
+
+on:
+  # Validate and plan infrastructure changes before they are merged
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "infra/**"
+      - "monitoring/**"
+      - ".github/workflows/00-infrastructure.yml"
+
+  # Apply infrastructure and monitoring changes once they reach main
+  push:
+    branches:
+      - main
+    paths:
+      - "infra/**"
+      - "monitoring/**"
+      - ".github/workflows/00-infrastructure.yml"
+
+  # Manual plan, apply or guarded destroy
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action"
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      confirm_destroy:
+        description: "Destroy only: type the resource group name to confirm"
+        required: false
+        type: string
+
+# This workflow is deliberately not chained to 01 - CI with workflow_run.
+# 01 -> 02 -> 03 -> 04 already uses the three workflow_run levels GitHub allows.
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: infrastructure
+  cancel-in-progress: false
+
+env:
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: "true"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_VERSION: "1.15.8"
+  CHART_VERSION: "91.4.1"
+
+jobs:
+
+  # =========================================================
+  # Terraform: format, validate, plan, and apply on main
+  # =========================================================
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.action != 'destroy'
+
+    defaults:
+      run:
+        working-directory: infra/terraform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: |
+          terraform plan -out=tfplan
+          {
+            echo "## Terraform plan (${{ github.event_name }})"
+            echo '```'
+            terraform show -no-color tfplan | grep -E '^Plan:|^No changes|will be (created|destroyed|updated)|must be replaced' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply'))
+        run: terraform apply tfplan
+
+  # =========================================================
+  # Monitoring: install kube-prometheus-stack and validate it
+  # =========================================================
+  monitoring:
+    name: Deploy and validate monitoring
+    runs-on: ubuntu-latest
+    needs:
+      - terraform
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply'))
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Install or upgrade kube-prometheus-stack
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --create-namespace \
+            --version "$CHART_VERSION" \
+            --values monitoring/values.yaml \
+            --wait \
+            --timeout 10m
+
+      - name: Provision KoalaTech Grafana dashboard
+        run: |
+          kubectl apply -f monitoring/dashboards/
+
+      - name: Validate monitoring pods
+        run: |
+          kubectl wait pods --all \
+            --namespace monitoring \
+            --for=condition=Ready \
+            --timeout=300s
+          kubectl get pods -n monitoring
+          kubectl get svc -n monitoring
+
+      - name: Validate Prometheus targets
+        run: |
+          kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090 > /dev/null 2>&1 &
+          sleep 5
+
+          for i in {1..18}; do
+            TARGETS=$(curl -s http://localhost:9090/api/v1/targets?state=active)
+            TOTAL=$(echo "$TARGETS" | jq '.data.activeTargets | length')
+            DOWN=$(echo "$TARGETS" | jq '[.data.activeTargets[] | select(.health != "up")] | length')
+            echo "Active targets: $TOTAL, not up: $DOWN"
+
+            if [ "$TOTAL" -gt 0 ] && [ "$DOWN" -eq 0 ]; then
+              echo "$TARGETS" | jq -r '.data.activeTargets[] | "\(.labels.job) \(.labels.instance) \(.health)"' | sort
+              NODES=$(curl -s http://localhost:9090/api/v1/query --data-urlencode 'query=count(kube_node_info)' | jq -r '.data.result[0].value[1]')
+              echo "Nodes reporting to Prometheus: $NODES"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Prometheus targets are not all up:"
+          echo "$TARGETS" | jq -r '.data.activeTargets[] | select(.health != "up") | "\(.labels.job) \(.labels.instance) \(.lastError)"'
+          exit 1
+
+  # =========================================================
+  # Destroy: manual, main only, confirmed by typing the resource group name
+  # =========================================================
+  destroy:
+    name: Terraform destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy' && github.ref == 'refs/heads/main'
+
+    defaults:
+      run:
+        working-directory: infra/terraform
+
+    steps:
+      - name: Check destroy confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm_destroy }}
+          EXPECTED: ${{ vars.AKS_RESOURCE_GROUP }}
+        run: |
+          if [ -z "$EXPECTED" ] || [ "$CONFIRM" != "$EXPECTED" ]; then
+            echo "Confirmation does not match the resource group name. Nothing was destroyed."
+            exit 1
+          fi
+          echo "Destroy confirmed for $EXPECTED"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform destroy plan
+        run: |
+          terraform plan -destroy -out=destroy.tfplan
+          terraform show -no-color destroy.tfplan | grep -E '^Plan:|will be destroyed' || true
+
+      - name: Terraform destroy
+        run: terraform apply destroy.tfplan
