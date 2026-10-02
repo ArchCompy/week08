@@ -14,13 +14,21 @@ jobs:
     name: Staging Smoke Test
     runs-on: ubuntu-latest
 
-    if: >
-      ${{ github.event.workflow_run.conclusion == 'success' }}
-
     environment:
       name: staging
 
     steps:
+      - name: Confirm staging deployment succeeded
+        env:
+          DEPLOY_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          echo "02 - Deploy to Staging conclusion: $DEPLOY_CONCLUSION"
+
+          if [ "$DEPLOY_CONCLUSION" != "success" ]; then
+            echo "Staging deployment did not succeed. Failing so production is not promoted."
+            exit 1
+          fi
+
       - name: Login to Azure
         uses: azure/login@v3
         with:
@@ -32,6 +40,28 @@ jobs:
             --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
             --name ${{ vars.AKS_CLUSTER_NAME }} \
             --overwrite-existing
+
+      - name: Check all staging images share one commit tag
+        run: |
+          TAGS=$(kubectl get deployment \
+            frontend user-service student-service \
+            lecturer-service course-service enrollment-service \
+            -n staging \
+            -o jsonpath='{range .items[*]}{.spec.template.spec.containers[0].image}{"\n"}{end}' \
+            | sed 's/.*://' | sort -u)
+
+          echo "Image tags running in staging:"
+          echo "$TAGS"
+
+          if [ "$(printf '%s\n' "$TAGS" | grep -c .)" -ne 1 ]; then
+            echo "Staging deployments do not share one image tag."
+            exit 1
+          fi
+
+          if ! [[ "$TAGS" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Staging image tag is not a full commit SHA."
+            exit 1
+          fi
 
       - name: Wait for staging frontend IP
         run: |
@@ -61,3 +91,31 @@ jobs:
             --retry 10 \
             --retry-delay 5 \
             http://${{ env.FRONTEND_IP }}
+
+      - name: Test each backend through the frontend proxy
+        run: |
+          for SERVICE in users students lecturers courses enrollments; do
+            BODY=$(curl \
+              --fail \
+              --silent \
+              --show-error \
+              --retry 10 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              "http://${FRONTEND_IP}/api/${SERVICE}/health")
+
+            echo "/api/${SERVICE}/health -> ${BODY}"
+
+            echo "$BODY" | grep -q '"status":"healthy"'
+          done
+
+      - name: Check for OOMKilled containers
+        run: |
+          kubectl get pods -n staging
+
+          if kubectl get pods -n staging \
+            -o jsonpath='{..lastState.terminated.reason}' \
+            | grep -q OOMKilled; then
+            echo "A staging container was OOMKilled."
+            exit 1
+          fi

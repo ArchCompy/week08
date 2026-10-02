@@ -5,6 +5,12 @@ on:
   push:
     branches:
       - main
+
+  # Run the tests on pull requests into main. The build job below is
+  # skipped for pull requests, so nothing is pushed to ACR or deployed.
+  pull_request:
+    branches:
+      - main
   
   # Manual trigger for the workflow
   workflow_dispatch:
