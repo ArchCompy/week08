@@ -323,19 +323,27 @@ jobs:
             exit 1
           fi
 
-          DOWN=$(curl -s "http://localhost:9090/api/v1/targets?state=active" \
-            | jq --arg ns "$NAMESPACE" '[.data.activeTargets[] | select(.labels.namespace == $ns and .health != "up")] | length')
-          echo "Scrape targets in $NAMESPACE that are not up: $DOWN"
+          # A pod replaced by this rollout gives Prometheus a new target that
+          # stays "unknown" until its first scrape, so wait for it rather than
+          # failing on the first poll.
+          for i in {1..12}; do
+            TARGETS=$(curl -s "http://localhost:9090/api/v1/targets?state=active")
+            DOWN=$(echo "$TARGETS" \
+              | jq --arg ns "$NAMESPACE" '[.data.activeTargets[] | select(.labels.namespace == $ns and .health != "up")] | length')
+            APP_TARGET=$(query "up{namespace=\"$NAMESPACE\", job=\"student-service\"}")
+            echo "Scrape targets in $NAMESPACE not yet up: $DOWN; student-service /metrics target up: $APP_TARGET"
 
-          if [ "$DOWN" -ne 0 ]; then
-            exit 1
-          fi
+            if [ "$DOWN" -eq 0 ] && [ "$APP_TARGET" = "1" ]; then
+              break
+            fi
 
-          APP_TARGET=$(query "up{namespace=\"$NAMESPACE\", job=\"student-service\"}")
-          echo "student-service /metrics target up: $APP_TARGET"
+            sleep 10
+          done
 
-          if [ "$APP_TARGET" != "1" ]; then
-            echo "Prometheus is not scraping student-service application metrics."
+          if [ "$DOWN" -ne 0 ] || [ "$APP_TARGET" != "1" ]; then
+            echo "Prometheus is not successfully scraping every target in $NAMESPACE:"
+            echo "$TARGETS" \
+              | jq -r --arg ns "$NAMESPACE" '.data.activeTargets[] | select(.labels.namespace == $ns and .health != "up") | "\(.labels.job) \(.scrapeUrl) \(.health) \(.lastError)"'
             exit 1
           fi
 
