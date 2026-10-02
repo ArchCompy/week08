@@ -174,8 +174,8 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Gate: fixable critical and high vulnerabilities.
-      # exit-code false reports without blocking; it is switched on after remediation.
+      # Gate: fail the job before any push if the image has a critical or
+      # high vulnerability that has a fixed version available.
       - name: Docker Scout gate (fixable critical and high)
         uses: docker/scout-action@v1.26.0
         with:
@@ -184,7 +184,7 @@ jobs:
           platform: linux/amd64
           only-severities: critical,high
           only-fixed: true
-          exit-code: false
+          exit-code: true
           write-comment: false
 
       - name: Docker Scout report for code scanning (all severities)
