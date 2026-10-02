@@ -9,6 +9,10 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   smoke-test:
     name: Staging Smoke Test
@@ -32,7 +36,9 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v3
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Get AKS credentials
         run: |
@@ -119,3 +125,47 @@ jobs:
             echo "A staging container was OOMKilled."
             exit 1
           fi
+
+      - name: Validate Prometheus is collecting staging metrics
+        env:
+          NAMESPACE: staging
+          EXPECTED_DEPLOYMENTS: "11"
+        run: |
+          kubectl get pods -n monitoring
+
+          kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090 > /dev/null 2>&1 &
+          sleep 5
+
+          query() {
+            curl -s http://localhost:9090/api/v1/query --data-urlencode "query=$1" \
+              | jq -r '.data.result[0].value[1] // "0"'
+          }
+
+          for i in {1..12}; do
+            AVAILABLE=$(query "count(kube_deployment_status_replicas_available{namespace=\"$NAMESPACE\"} >= 1)")
+            echo "Deployments with an available replica in $NAMESPACE, according to Prometheus: $AVAILABLE of $EXPECTED_DEPLOYMENTS"
+
+            if [ "$AVAILABLE" = "$EXPECTED_DEPLOYMENTS" ]; then
+              break
+            fi
+
+            sleep 10
+          done
+
+          if [ "$AVAILABLE" != "$EXPECTED_DEPLOYMENTS" ]; then
+            echo "Prometheus does not show every $NAMESPACE deployment as available."
+            exit 1
+          fi
+
+          DOWN=$(curl -s "http://localhost:9090/api/v1/targets?state=active" \
+            | jq --arg ns "$NAMESPACE" '[.data.activeTargets[] | select(.labels.namespace == $ns and .health != "up")] | length')
+          echo "Scrape targets in $NAMESPACE that are not up: $DOWN"
+
+          if [ "$DOWN" -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "Memory working set per pod in $NAMESPACE (MiB):"
+          curl -s http://localhost:9090/api/v1/query \
+            --data-urlencode "query=sum by (pod) (container_memory_working_set_bytes{namespace=\"$NAMESPACE\", container!=\"\"}) / 1048576" \
+            | jq -r '.data.result[] | "\(.metric.pod) \(.value[1] | tonumber | floor)"'
