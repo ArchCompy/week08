@@ -196,6 +196,8 @@ jobs:
 
     steps:
       - name: Check destroy confirmation
+        # Runs before checkout, so it cannot use the job's infra/terraform default
+        working-directory: ${{ github.workspace }}
         env:
           CONFIRM: ${{ inputs.confirm_destroy }}
           EXPECTED: ${{ vars.AKS_RESOURCE_GROUP }}
